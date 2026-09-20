@@ -1,12 +1,21 @@
 import { execSync, execFile, execFileSync, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  mkdirSync,
+  statSync,
+  accessSync,
+  constants,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -43,7 +52,15 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (
+    pref === "cmux" ||
+    pref === "tmux" ||
+    pref === "zellij" ||
+    pref === "wezterm" ||
+    pref === "herdr"
+  ) {
+    return pref;
+  }
   return null;
 }
 
@@ -63,6 +80,38 @@ function isWezTermRuntimeAvailable(): boolean {
   return !!process.env.WEZTERM_UNIX_SOCKET && hasCommand("wezterm");
 }
 
+/**
+ * Resolve the herdr CLI binary: `PI_HERDR_BIN` > `herdr` on PATH > `/usr/bin/herdr`.
+ * PATH wins over /usr/bin because a file existing there says nothing about its
+ * protocol compatibility with the running server; installations that need a
+ * specific binary (e.g. PATH CLI newer than the fleet's server) set
+ * PI_HERDR_BIN explicitly.
+ */
+function herdrBinary(): string {
+  if (process.env.PI_HERDR_BIN) return process.env.PI_HERDR_BIN;
+  if (hasCommand("herdr")) return "herdr";
+  if (existsSync("/usr/bin/herdr")) return "/usr/bin/herdr";
+  return "herdr";
+}
+
+/** Check executability of the resolved binary without interpolating its path
+ * into a shell: X_OK access check for paths, PATH lookup for bare names. */
+function isExecutableBinary(path: string): boolean {
+  if (path.includes("/")) {
+    try {
+      accessSync(path, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return hasCommand(path);
+}
+
+function isHerdrRuntimeAvailable(): boolean {
+  return process.env.HERDR_ENV === "1" && isExecutableBinary(herdrBinary());
+}
+
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
@@ -79,17 +128,30 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
+export function isHerdrAvailable(): boolean {
+  return isHerdrRuntimeAvailable();
+}
+
+/** Test-only hooks: reset the hasCommand cache between env-matrix cases. */
+export const __cmuxTestHooks__ = {
+  clearCommandAvailabilityCache: (): void => {
+    commandAvailability.clear();
+  },
+};
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
+  if (pref === "herdr") return isHerdrRuntimeAvailable() ? "herdr" : null;
 
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
+  if (isHerdrRuntimeAvailable()) return "herdr";
   return null;
 }
 
@@ -111,7 +173,10 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  if (pref === "herdr") {
+    return "Start pi inside herdr (`herdr`, then run `pi`).";
+  }
+  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), WezTerm, or herdr (`herdr`, then run `pi`).";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -742,11 +807,145 @@ function createCmuxSplitSurface(
 }
 
 /**
+ * Herdr (https://herdr.dev) — terminal workspace manager for AI coding agents.
+ * Panes are controlled through the `herdr` CLI, which talks to the running
+ * session's socket API. Surface ids are opaque herdr pane ids like "w1:p2".
+ */
+
+const DEFAULT_HERDR_TIMEOUT_MS = 10_000;
+
+/** Per-call timeout for herdr CLI invocations (PI_HERDR_TIMEOUT_MS overrides). */
+function herdrTimeoutMs(): number {
+  const raw = Number(process.env.PI_HERDR_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_HERDR_TIMEOUT_MS;
+}
+
+function isHerdrTimeoutError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const record = error as NodeJS.ErrnoException & { killed?: boolean };
+  return record.code === "ETIMEDOUT" || !!record.killed || /timed out/i.test(error.message);
+}
+
+/** Attach a clear message when the herdr CLI exceeded its deadline. */
+function enrichHerdrError(error: unknown, bin: string, args: string[]): unknown {
+  if (error instanceof Error && isHerdrTimeoutError(error)) {
+    return new Error(
+      `herdr ${args.slice(0, 2).join(" ")} timed out after ${herdrTimeoutMs()}ms (bin: ${bin})`,
+    );
+  }
+  return error;
+}
+
+/*
+ * Both wrappers enforce a finite deadline: a hung CLI must never block pi
+ * (sync path) nor leave pollForExit waiting without re-checking abort/sidecar
+ * (async path — the rejection falls into pollForExit's read-error branch and
+ * the poll loop continues). SIGKILL because a stuck child may ignore SIGTERM.
+ */
+export function herdrExecFileSync(args: string[]): string {
+  const bin = herdrBinary();
+  try {
+    return execFileSync(bin, args, {
+      encoding: "utf8",
+      timeout: herdrTimeoutMs(),
+      killSignal: "SIGKILL",
+    });
+  } catch (error) {
+    throw enrichHerdrError(error, bin, args);
+  }
+}
+
+export async function herdrExecFileAsync(args: string[]): Promise<string> {
+  const bin = herdrBinary();
+  try {
+    const { stdout } = await execFileAsync(bin, args, {
+      encoding: "utf8",
+      timeout: herdrTimeoutMs(),
+      killSignal: "SIGKILL",
+    });
+    return stdout;
+  } catch (error) {
+    throw enrichHerdrError(error, bin, args);
+  }
+}
+
+/**
+ * Build `herdr pane split` argv. Anchors on the explicit pane id when given,
+ * otherwise on the calling pane (`--current`). `--no-focus` keeps the user's
+ * focus on the calling pane.
+ */
+export function herdrSplitArgs(
+  direction: "right" | "down",
+  options?: { fromPaneId?: string; cwd?: string },
+): string[] {
+  const args = ["pane", "split"];
+  if (options?.fromPaneId) {
+    args.push("--pane", options.fromPaneId);
+  } else {
+    args.push("--current");
+  }
+  args.push("--direction", direction);
+  args.push("--no-focus");
+  const cwd = options?.cwd ?? process.cwd();
+  if (cwd) args.push("--cwd", cwd);
+  return args;
+}
+
+/** Build `herdr pane read` argv. `recent-unwrapped` avoids terminal line wraps
+ * splitting sentinel markers across lines (pollForExit reads the tail). */
+export function herdrReadArgs(paneId: string, lines: number): string[] {
+  return [
+    "pane",
+    "read",
+    paneId,
+    "--source",
+    "recent-unwrapped",
+    "--lines",
+    String(Math.max(1, lines)),
+  ];
+}
+
+/** Extract the new pane id from `herdr pane split` JSON output (`result.pane.pane_id`). */
+export function parseHerdrPaneId(output: string): string {
+  const parsed = parseCmuxJson(output);
+  if (parsed && typeof parsed === "object") {
+    const record = parsed as { result?: unknown };
+    const result = record.result;
+    if (result && typeof result === "object") {
+      const pane = (result as { pane?: unknown }).pane;
+      if (pane && typeof pane === "object") {
+        const paneId = (pane as { pane_id?: unknown }).pane_id;
+        if (typeof paneId === "string" && paneId !== "") return paneId;
+      }
+    }
+  }
+  throw new Error(`Unexpected herdr pane split output: ${output.slice(0, 200) || "(empty)"}`);
+}
+
+function createHerdrSplitSurface(
+  name: string,
+  direction: "right" | "down",
+  fromSurface?: string,
+): string {
+  const output = herdrExecFileSync(
+    herdrSplitArgs(direction, { fromPaneId: fromSurface || process.env.HERDR_PANE_ID }),
+  );
+  const paneId = parseHerdrPaneId(output);
+  try {
+    herdrExecFileSync(["pane", "rename", paneId, name]);
+  } catch {
+    // Optional — pane label is cosmetic.
+  }
+  return paneId;
+}
+
+/**
  * Create a new terminal surface for a subagent.
  *
  * For cmux: the first call creates a right-split pane; subsequent calls add
  * tabs to that same pane (avoiding ever-narrower splits).
  * For zellij: chooses a tab-aware tiled or stacked placement.
+ * For herdr: splits the calling pane to the right without stealing focus.
  * For tmux/wezterm: falls back to split behavior.
  *
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
@@ -774,6 +973,10 @@ export function createSurface(name: string): string {
 
   if (backend === "zellij") {
     return createZellijSurface(name);
+  }
+
+  if (backend === "herdr") {
+    return createHerdrSplitSurface(name, "right");
   }
 
   // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
@@ -870,6 +1073,13 @@ export function createSurfaceSplit(
     return paneId;
   }
 
+  if (backend === "herdr") {
+    // herdr only supports splitting right/down; left/up fall back to the same
+    // axis in v1 (no post-split move).
+    const herdrDirection = direction === "up" || direction === "down" ? "down" : "right";
+    return createHerdrSplitSurface(name, herdrDirection, fromSurface);
+  }
+
   // zellij
   const directionArg = direction === "left" || direction === "right" ? "right" : "down";
   const args = ["new-pane", "--direction", directionArg, "--name", name, "--cwd", process.cwd()];
@@ -909,6 +1119,12 @@ export function createSurfaceSplit(
  */
 export function renameCurrentTab(title: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    // v1: no tab rename for herdr — herdr labels panes, not tabs, and the
+    // subagent pane already gets a label at creation time.
+    return;
+  }
 
   if (backend === "cmux") {
     const surfaceId = process.env.CMUX_SURFACE_ID;
@@ -957,6 +1173,12 @@ export function renameCurrentTab(title: string): void {
  */
 export function renameWorkspace(title: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    // v1: no workspace rename for herdr (workspace ids are opaque short handles
+    // like "w1"; renaming them offers little value for subagent surfaces).
+    return;
+  }
 
   if (backend === "cmux") {
     execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, {
@@ -1018,6 +1240,13 @@ export function sendCommand(surface: string, command: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    // `pane run` sends the text and Enter in one call; argv passes the command
+    // through verbatim (no shell on our side).
+    herdrExecFileSync(["pane", "run", surface, command]);
+    return;
+  }
+
   if (backend === "tmux") {
     execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
     execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
@@ -1045,6 +1274,11 @@ export function sendEscape(surface: string): void {
 
   if (backend === "cmux") {
     execFileSync("cmux", ["send", "--surface", surface, "\u001b"], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "herdr") {
+    herdrExecFileSync(["pane", "send-keys", surface, "esc"]);
     return;
   }
 
@@ -1113,6 +1347,10 @@ export function readScreen(surface: string, lines = 50): string {
     });
   }
 
+  if (backend === "herdr") {
+    return tailLines(herdrExecFileSync(herdrReadArgs(surface, lines)), lines);
+  }
+
   if (backend === "tmux") {
     return execFileSync(
       "tmux",
@@ -1159,6 +1397,10 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     return stdout;
   }
 
+  if (backend === "herdr") {
+    return tailLines(await herdrExecFileAsync(herdrReadArgs(surface, lines)), lines);
+  }
+
   if (backend === "tmux") {
     const { stdout } = await execFileAsync(
       "tmux",
@@ -1197,6 +1439,11 @@ export function closeSurface(surface: string): void {
     execSync(`cmux close-surface --surface ${shellEscape(surface)}`, {
       encoding: "utf8",
     });
+    return;
+  }
+
+  if (backend === "herdr") {
+    herdrExecFileSync(["pane", "close", surface]);
     return;
   }
 

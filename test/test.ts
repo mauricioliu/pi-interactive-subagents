@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,13 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  isHerdrAvailable,
+  herdrSplitArgs,
+  herdrReadArgs,
+  parseHerdrPaneId,
+  herdrExecFileSync,
+  herdrExecFileAsync,
+  __cmuxTestHooks__,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
@@ -55,6 +62,7 @@ import {
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+import { pollForExit } from "../pi-extension/subagents/cmux.ts";
 
 // --- Helpers ---
 
@@ -2373,6 +2381,266 @@ describe("cmux.ts", () => {
     it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("isHerdrAvailable", () => {
+    it("returns boolean based on HERDR_ENV", () => {
+      const result = isHerdrAvailable();
+      assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("herdrSplitArgs", () => {
+    it("anchors on explicit pane id when given", () => {
+      assert.deepEqual(herdrSplitArgs("right", { fromPaneId: "w1:p2", cwd: "/tmp" }), [
+        "pane",
+        "split",
+        "--pane",
+        "w1:p2",
+        "--direction",
+        "right",
+        "--no-focus",
+        "--cwd",
+        "/tmp",
+      ]);
+    });
+
+    it("anchors on the calling pane without an explicit id", () => {
+      assert.deepEqual(herdrSplitArgs("down", { cwd: "/tmp" }), [
+        "pane",
+        "split",
+        "--current",
+        "--direction",
+        "down",
+        "--no-focus",
+        "--cwd",
+        "/tmp",
+      ]);
+    });
+
+    it("defaults cwd to process.cwd()", () => {
+      const args = herdrSplitArgs("right", { fromPaneId: "w1:p2" });
+      assert.ok(args.includes("--cwd"));
+      assert.equal(args[args.indexOf("--cwd") + 1], process.cwd());
+    });
+
+    it("omits --cwd when explicitly disabled", () => {
+      const args = herdrSplitArgs("right", { fromPaneId: "w1:p2", cwd: "" });
+      assert.ok(!args.includes("--cwd"));
+    });
+  });
+
+  describe("herdrReadArgs", () => {
+    it("reads unwrapped recent output with line count", () => {
+      assert.deepEqual(herdrReadArgs("w1:p2", 50), [
+        "pane",
+        "read",
+        "w1:p2",
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        "50",
+      ]);
+    });
+
+    it("clamps lines to at least 1", () => {
+      assert.deepEqual(herdrReadArgs("w1:p2", 0), [
+        "pane",
+        "read",
+        "w1:p2",
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        "1",
+      ]);
+    });
+  });
+
+  describe("parseHerdrPaneId", () => {
+    it("parses result.pane.pane_id from the JSON envelope", () => {
+      const output = JSON.stringify({
+        id: "cli:pane:split",
+        result: { pane: { pane_id: "wJ:pK", label: "agent" } },
+        type: "pane_split",
+      });
+      assert.equal(parseHerdrPaneId(output), "wJ:pK");
+    });
+
+    it("throws on missing result.pane", () => {
+      assert.throws(() => parseHerdrPaneId(JSON.stringify({ result: {} })), /Unexpected herdr/);
+    });
+
+    it("throws on missing pane_id", () => {
+      assert.throws(
+        () => parseHerdrPaneId(JSON.stringify({ result: { pane: { label: "x" } } })),
+        /Unexpected herdr/,
+      );
+    });
+
+    it("throws on non-JSON output", () => {
+      assert.throws(() => parseHerdrPaneId("not json"), /Unexpected herdr/);
+    });
+
+    it("throws on empty output with (empty) marker", () => {
+      assert.throws(() => parseHerdrPaneId(""), /\(empty\)/);
+    });
+
+    it("includes output snippet in the error", () => {
+      assert.throws(() => parseHerdrPaneId("oops"), /oops/);
+    });
+  });
+
+  // --- Herdr availability / process handling (review m1 + m3) ---
+
+  /** Mutate env for one case, restoring state and the hasCommand cache after. */
+  async function withHerdrEnv(
+    vars: Record<string, string | undefined>,
+    fn: () => Promise<void> | void,
+  ): Promise<void> {
+    const saved: Record<string, string | undefined> = {};
+    for (const key of Object.keys(vars)) {
+      saved[key] = process.env[key];
+    }
+    for (const [key, value] of Object.entries(vars)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    try {
+      await fn();
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+      __cmuxTestHooks__.clearCommandAvailabilityCache();
+    }
+  }
+
+  describe("isHerdrAvailable env/binary matrix", () => {
+    it("true when HERDR_ENV=1 and the resolved PI_HERDR_BIN is executable", async () => {
+      await withHerdrEnv({ HERDR_ENV: "1", PI_HERDR_BIN: "/bin/sh" }, () => {
+        assert.equal(isHerdrAvailable(), true);
+      });
+    });
+
+    it("false when the resolved PI_HERDR_BIN is not executable", async () => {
+      await withHerdrEnv({ HERDR_ENV: "1", PI_HERDR_BIN: "/nonexistent/herdr" }, () => {
+        assert.equal(isHerdrAvailable(), false);
+      });
+    });
+
+    it("false without HERDR_ENV even when the binary resolves", async () => {
+      await withHerdrEnv({ HERDR_ENV: undefined, PI_HERDR_BIN: "/bin/sh" }, () => {
+        assert.equal(isHerdrAvailable(), false);
+      });
+    });
+
+    it("returns boolean without override (machine-dependent PATH//usr/bin)", async () => {
+      await withHerdrEnv({ PI_HERDR_BIN: undefined }, () => {
+        assert.equal(typeof isHerdrAvailable(), "boolean");
+      });
+    });
+
+    it("cache isolation: unavailable then available resolves with the right binary", async () => {
+      await withHerdrEnv({ HERDR_ENV: "1", PI_HERDR_BIN: "/nonexistent/herdr" }, () => {
+        assert.equal(isHerdrAvailable(), false);
+      });
+      await withHerdrEnv({ HERDR_ENV: "1", PI_HERDR_BIN: "/bin/sh" }, () => {
+        assert.equal(isHerdrAvailable(), true);
+      });
+    });
+  });
+
+  describe("herdr wrappers enforce a deadline (M1)", () => {
+    let dir: string;
+
+    before(() => {
+      dir = mkdtempSync(join(tmpdir(), "pi-herdr-wrap-"));
+    });
+
+    after(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("async wrapper rejects when the CLI never responds", async () => {
+      const hang = join(dir, "hang.sh");
+      writeFileSync(hang, "#!/bin/bash\nexec sleep 30\n");
+      chmodSync(hang, 0o755);
+      await withHerdrEnv({ PI_HERDR_BIN: hang, PI_HERDR_TIMEOUT_MS: "150" }, async () => {
+        await assert.rejects(herdrExecFileAsync(["pane", "read", "w1:p1"]), /timed out/);
+      });
+    });
+
+    it("sync wrapper throws when the CLI never responds", async () => {
+      const hang = join(dir, "hang.sh");
+      writeFileSync(hang, "#!/bin/bash\nexec sleep 30\n");
+      chmodSync(hang, 0o755);
+      await withHerdrEnv({ PI_HERDR_BIN: hang, PI_HERDR_TIMEOUT_MS: "150" }, () => {
+        assert.throws(() => herdrExecFileSync(["pane", "read", "w1:p1"]), /timed out/);
+      });
+    });
+
+    it("pollForExit re-checks abort even when reads never return", async () => {
+      const hang = join(dir, "hang.sh");
+      writeFileSync(hang, "#!/bin/bash\nexec sleep 30\n");
+      chmodSync(hang, 0o755);
+      await withHerdrEnv(
+        {
+          HERDR_ENV: "1",
+          PI_SUBAGENT_MUX: "herdr",
+          PI_HERDR_BIN: hang,
+          PI_HERDR_TIMEOUT_MS: "100",
+        },
+        async () => {
+          const controller = new AbortController();
+          setTimeout(() => controller.abort(), 250);
+          await assert.rejects(
+            pollForExit("w1:p1", controller.signal, { interval: 50 }),
+            /Aborted/,
+          );
+        },
+      );
+    });
+  });
+
+  describe("herdr sentinel recovery via recent-unwrapped (m3)", () => {
+    it("detects a physically wrapped sentinel joined by --source recent-unwrapped", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pi-herdr-sentinel-"));
+      try {
+        const reader = join(dir, "reader.sh");
+        // Simulates `pane read --source recent-unwrapped --lines 5` on a narrow
+        // pane: the sentinel was soft-wrapped across physical lines and the CLI
+        // rejoins it into one line within the requested tail.
+        writeFileSync(
+          reader,
+          "#!/bin/bash\n" +
+            'printf "agent still working on the task\\u2026\\n"\n' +
+            'printf "narrow pane physically wrapped: __SUBAGENT_DONE_7__\\n"\n',
+        );
+        chmodSync(reader, 0o755);
+        await withHerdrEnv(
+          {
+            HERDR_ENV: "1",
+            PI_SUBAGENT_MUX: "herdr",
+            PI_HERDR_BIN: reader,
+          },
+          async () => {
+            const controller = new AbortController();
+            const result = await pollForExit("w1:p1", controller.signal, { interval: 50 });
+            assert.equal(result.reason, "sentinel");
+            assert.equal(result.exitCode, 7);
+          },
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
   });
 });
